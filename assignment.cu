@@ -145,59 +145,150 @@ void setupContext(NppStreamContext& ctx) {
     ctx.nCudaDevAttrComputeCapabilityMinor = prop.minor;
 }
 
-void processFrame(
-    unsigned char* d_gray, 
-    char gray_threshold,
-    int bw_mode, 
-    unsigned char* d_bw,
-    unsigned char* d_mark,
-    int w,
-    int h, 
-    cudaStream_t stream     // the cuda stream to use for this frame
-) {
-    size_t size = (size_t) w*h;
-    
-    int BLOCK = 16;
-    dim3 threads(BLOCK,BLOCK);
-    dim3 blocks((w+BLOCK-1)/BLOCK,(h+BLOCK-1)/BLOCK);
 
-    // threshold pre-processing
-    threshold_kernel<<<blocks,threads>>>(d_gray, d_bw, w, h, gray_threshold, bw_mode);
-    cudaDeviceSynchronize();
-
-    // skeletonization (Zhang Suen) 
-
-    int max_itr = 1000; // in case no success
-    bool changed;
-    for (int itr=0; itr<max_itr; itr++) {
-        changed = false;
-        for (int pass=0; pass<2; pass++) { // pass 1, 2
-            ZhangSuenMark<<<blocks,threads>>>(d_bw, d_mark, w, h, pass);
-            cudaDeviceSynchronize();
-
-            // Thrust: count marked pixels
-            thrust::device_ptr<unsigned char> dev_mark(d_mark);
-            int numMarked = thrust::reduce(thrust::device, 
-                                            dev_mark, dev_mark + w*h, 0);
-            if(numMarked > 0) changed = true;
-
-            removeMarked<<<blocks,threads>>>(d_bw, d_mark, w, h);
-            cudaDeviceSynchronize();
-        }
-        if (!changed) { // finish
-            break;
-        }
-    }
-    if (changed) {
-        std::cout << "did not finish zhang suen" << std::endl;
-    }
-}
 
 unsigned char getViableThreshold(const cv::Mat& gray_frame) {
     if (gray_frame.empty()) return 128; // Safety fallback
     cv::Scalar mean_val = cv::mean(gray_frame);
     return 0.9*static_cast<unsigned char>(mean_val.val[0]);
 }
+
+#define NUM_STREAMS 5
+class FrameProcessor {
+    private:
+        // image properties
+        int width; 
+        int height;
+        int bufferSize_gray;
+        int img_size;
+        // processing settings
+        unsigned char gray_threshold;
+        int bw_mode;
+
+        // per-stream variables/buffers
+        cudaStream_t streams[NUM_STREAMS];
+
+        // device pointers
+        unsigned char* d_gray[NUM_STREAMS];
+        unsigned char* d_bw[NUM_STREAMS];
+        unsigned char *d_mark[NUM_STREAMS];
+
+        // host 
+        unsigned char *h_pinned_buffer[NUM_STREAMS];
+        cv::Mat h_result_mats[NUM_STREAMS];
+
+        // gpu blocks thread dim
+        int BLOCK = 16;
+        dim3 threads;
+        dim3 blocks;
+
+    public:
+        FrameProcessor(int w, int h, unsigned char threshold_value, int bw_mode) {
+            this->gray_threshold = threshold_value;
+            this->bw_mode = bw_mode;
+            
+            this->width = w;
+            this->height = h;
+            this->img_size = width*height;
+            this->bufferSize_gray = (size_t)width * height * sizeof(unsigned char);
+
+            this->threads = dim3(BLOCK,BLOCK);
+            this->blocks = dim3((width+BLOCK-1)/BLOCK,(height+BLOCK-1)/BLOCK);
+            
+            // allocate memory for streams
+            for (int i=0; i<NUM_STREAMS; i++) {
+                cudaStreamCreate(&streams[i]);
+                // allocate device memory
+                cudaMalloc(&d_gray[i], img_size);
+                cudaMalloc(&d_bw[i], img_size);
+                cudaMalloc(&d_mark[i], img_size);
+
+                // allocate host (pinned)
+                checkCudaError(cudaHostAlloc(&h_pinned_buffer[i], bufferSize_gray, cudaHostAllocPortable), 
+                            "Host pinned allocation failed");
+
+                // Initialize output Mat to use the pinned memory buffer
+                h_result_mats[i] = cv::Mat(height, width, CV_8UC1, h_pinned_buffer[i]);
+            }
+        }
+
+        ~FrameProcessor() {
+            for (int i=0; i<NUM_STREAMS; i++) {
+                cudaFree(d_gray[i]);
+                cudaFree(d_bw[i]);
+                cudaFree(d_mark[i]);
+                cudaFreeHost(h_pinned_buffer[i]);
+                cudaStreamDestroy(streams[i]);
+            }
+        }
+
+        void processFrame(
+            int stream_idx
+        ) {
+            
+            // threshold pre-processing
+            threshold_kernel<<<blocks,threads, 0, streams[stream_idx]>>>(d_gray[stream_idx], d_bw[stream_idx], width, height, gray_threshold, bw_mode);
+            cudaStreamSynchronize(streams[stream_idx]);
+
+            // skeletonization (Zhang Suen) 
+
+            int max_itr = 1000; // in case no success
+            bool changed;
+            for (int itr=0; itr<max_itr; itr++) {
+                changed = false;
+                for (int pass=0; pass<2; pass++) { // pass 1, 2
+                    ZhangSuenMark<<<blocks,threads, 0, streams[stream_idx]>>>(d_bw[stream_idx], d_mark[stream_idx], width, height, pass);
+                    cudaStreamSynchronize(streams[stream_idx]);
+
+                    // Thrust: count marked pixels
+                    thrust::device_ptr<unsigned char> dev_mark(d_mark[stream_idx]);
+                    int numMarked = thrust::reduce(thrust::device, 
+                                                    dev_mark, dev_mark + width*height, 0);
+                    if(numMarked > 0) changed = true;
+
+                    removeMarked<<<blocks,threads, 0, streams[stream_idx]>>>(d_bw[stream_idx], d_mark[stream_idx], width, height);
+                    cudaStreamSynchronize(streams[stream_idx]);
+                }
+                if (!changed) { // finish
+                    break;
+                }
+            }
+            if (changed) {
+                std::cout << "did not finish zhang suen" << std::endl;
+            }
+        }
+
+        void copyAndStartFrameProcess(
+            cv::Mat h_color_frame,
+            int stream_idx
+        ) {
+            cv::Mat h_gray_frame;
+
+            // convert RGB --> Grayscale
+            cv::cvtColor(h_color_frame, h_gray_frame, cv::COLOR_BGR2GRAY);
+
+            // copy data and launch initial kernels
+            checkCudaError(cudaMemcpyAsync(d_gray[stream_idx], h_gray_frame.data, bufferSize_gray, 
+                                            cudaMemcpyHostToDevice, streams[stream_idx]), 
+                            "H2D copy failed");
+
+            processFrame(stream_idx);
+        }
+
+        void writeBackFrameProcessResult(
+            const int& stream_idx,
+            cv::VideoWriter& writer
+        ) {
+            checkCudaError(cudaStreamSynchronize(streams[stream_idx]), "Stream sync failed");
+
+            checkCudaError(cudaMemcpyAsync(h_pinned_buffer[stream_idx], d_bw[stream_idx], 
+                                            bufferSize_gray, cudaMemcpyDeviceToHost, streams[stream_idx]), 
+                            "D2H copy failed");
+
+            checkCudaError(cudaStreamSynchronize(streams[stream_idx]), "D2H sync failed");
+            writer.write(h_result_mats[stream_idx]);
+        }
+};
 
 
 int main(int argc , char** argv) {
@@ -262,51 +353,17 @@ int main(int argc , char** argv) {
         return -1;
     }
 
-
-    // allocate all needed memory for each stream
-    const int NUM_STREAMS = 5;
-
-    size_t gray_size = (size_t)w * h * sizeof(unsigned char);
-    cudaStream_t streams[NUM_STREAMS];
-
-    unsigned char* d_gray[NUM_STREAMS];
-    unsigned char* d_bw[NUM_STREAMS];
-    unsigned char *d_mark[NUM_STREAMS];
-    unsigned char *h_pinned_buffer[NUM_STREAMS];
-    cv::Mat h_result_mats[NUM_STREAMS];
-
-    for (int i=0; i<NUM_STREAMS; i++) {
-        cudaStreamCreate(&streams[i]);
-        // allocate device memory
-        cudaMalloc(&d_gray[i], w*h);
-        cudaMalloc(&d_bw[i], w*h);
-        cudaMalloc(&d_mark[i], w*h);
-
-        // allocate host (pinned)
-        checkCudaError(cudaHostAlloc(&h_pinned_buffer[i], gray_size, cudaHostAllocPortable), 
-                       "Host pinned allocation failed");
-
-        // Initialize output Mat to use the pinned memory buffer
-        h_result_mats[i] = cv::Mat(h, w, CV_8UC1, h_pinned_buffer[i]);
-    }
+    // create FrameProcessor object
+    FrameProcessor fp(w, h, threshold_value, bw_mode);
 
     // kick off initial streams
-    cv::Mat h_color_frame, h_gray_frame;
+    cv::Mat h_color_frame;
     int frames_processed = 0;
 
-    for (int i=0; i<NUM_STREAMS; i++) {
+    for (int stream_idx=0; stream_idx<NUM_STREAMS; stream_idx++) {
         cap >> h_color_frame;
-        if (h_color_frame.empty()) break;
-
-        // convert RGB --> Grayscale
-        cv::cvtColor(h_color_frame, h_gray_frame, cv::COLOR_BGR2GRAY);
-
-        // copy data and launch initial kernels
-        checkCudaError(cudaMemcpyAsync(d_gray[i], h_gray_frame.data, gray_size, 
-                                        cudaMemcpyHostToDevice, streams[i]), 
-                       "H2D copy failed");
-
-        processFrame(d_gray[i], threshold_value, bw_mode, d_bw[i], d_mark[i], w, h, streams[i]);
+        if (h_color_frame.empty()) break; // End of video
+        fp.copyAndStartFrameProcess(h_color_frame, stream_idx);
     }
 
     int current_stream = 0;
@@ -314,27 +371,14 @@ int main(int argc , char** argv) {
     while (true) {
         // wait for current oldest frame so it can be written in order
         // other streams continue to process
-        checkCudaError(cudaStreamSynchronize(streams[current_stream]), "Stream sync failed");
-
-        checkCudaError(cudaMemcpyAsync(h_pinned_buffer[current_stream], d_bw[current_stream], 
-                                        gray_size, cudaMemcpyDeviceToHost, streams[current_stream]), 
-                       "D2H copy failed");
-
-        checkCudaError(cudaStreamSynchronize(streams[current_stream]), "D2H sync failed");
-        writer.write(h_result_mats[current_stream]);
+        fp.writeBackFrameProcessResult(current_stream, writer);
         frames_processed++;
         std::cout << "finished " << frames_processed << "th frame" << std::endl;
         
         // kick off next frame
         cap >> h_color_frame;
         if (h_color_frame.empty()) break; // End of video
-
-        cv::cvtColor(h_color_frame, h_gray_frame, cv::COLOR_BGR2GRAY);
-        checkCudaError(cudaMemcpyAsync(d_gray[current_stream], h_gray_frame.data, gray_size, 
-                                        cudaMemcpyHostToDevice, streams[current_stream]), 
-                       "H2D copy failed");
-        
-        processFrame(d_gray[current_stream], threshold_value, bw_mode, d_bw[current_stream], d_mark[current_stream], w, h, streams[current_stream]);
+        fp.copyAndStartFrameProcess(h_color_frame, current_stream);
         
         // to next stream
         current_stream = (current_stream + 1) % NUM_STREAMS;
@@ -344,18 +388,10 @@ int main(int argc , char** argv) {
     for (int i = 0; i < NUM_STREAMS; ++i) {
         int stream_idx = (current_stream + i) % NUM_STREAMS;
         
-        checkCudaError(cudaStreamSynchronize(streams[stream_idx]), "Flush sync failed");
-        
-        // Copy processed data from Device (d_bw) to Host Pinned Memory (h_pinned_buffer)
-        checkCudaError(cudaMemcpyAsync(h_pinned_buffer[stream_idx], d_bw[stream_idx], 
-                                        gray_size, cudaMemcpyDeviceToHost, streams[stream_idx]), 
-                       "D2H copy failed during flush");
-
-        checkCudaError(cudaStreamSynchronize(streams[stream_idx]), "D2H sync failed during flush");
-        
-        // Write the remaining frame
-        writer.write(h_result_mats[stream_idx]);
+        fp.writeBackFrameProcessResult(stream_idx, writer);
         frames_processed++;
+        std::cout << "finished " << frames_processed << "th frame" << std::endl;
+
     }
 
     // clean up
@@ -364,13 +400,7 @@ int main(int argc , char** argv) {
     writer.release();
     cap.release();
 
-    for (int i=0; i<NUM_STREAMS; i++) {
-        cudaFree(d_gray[i]);
-        cudaFree(d_bw[i]);
-        cudaFree(d_mark[i]);
-        cudaFreeHost(h_pinned_buffer[i]);
-        cudaStreamDestroy(streams[i]);
-    }
+
 
     return 0;
 }
