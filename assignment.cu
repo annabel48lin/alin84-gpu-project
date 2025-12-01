@@ -5,17 +5,15 @@
 #include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
 
-#include <npp.h>
-#include <nppcore.h> 
-#include <nppi.h>
-#include <nppdefs.h>
-
 #include <filesystem>
 #include <string>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/cuda.hpp>
 
+/**
+ * Helper for outputting if CUDA has errored
+ */
 void checkCudaError(cudaError_t err, const char *msg) {
     if (err != cudaSuccess) {
         std::cerr << "CUDA Error: " << msg << " - " << cudaGetErrorString(err) << std::endl;
@@ -23,6 +21,9 @@ void checkCudaError(cudaError_t err, const char *msg) {
     }
 }
 
+/**
+ * Kernel for thresholding a grayscale image into b/w
+ */
 __global__ void threshold_kernel(
     unsigned char* d_input, 
     unsigned char* d_output, 
@@ -44,6 +45,10 @@ __global__ void threshold_kernel(
     }
 }
 
+/**
+ * Helper fucntion for determining whether a pixel is black.
+ * Used in ZHangSuenMark
+ */
 __device__ inline int isPixelBlack(
     const unsigned char* img , 
     int x, 
@@ -55,6 +60,9 @@ __device__ inline int isPixelBlack(
     return img[y*w+x] > 0 ? 1 : 0;
 }
 
+/**
+ * Uses ZhangSuen conditions to determine whether a black pixel should be removed
+ */
 __global__
 void ZhangSuenMark(
     const unsigned char* src, 
@@ -124,6 +132,9 @@ void ZhangSuenMark(
     }
 }
 
+/**
+ * Remove pixels marked by ZhangSuenMark
+ */
 __global__ void removeMarked(unsigned char* img, const unsigned char* mark, int w, int h) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -131,28 +142,10 @@ __global__ void removeMarked(unsigned char* img, const unsigned char* mark, int 
     if (mark[y*w + x]) img[y*w + x] = 0;
 }
 
-void setupContext(NppStreamContext& ctx) {
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-    ctx.nCudaDeviceId = device;
-    ctx.nMultiProcessorCount = prop.multiProcessorCount;
-    ctx.nMaxThreadsPerMultiProcessor = prop.maxThreadsPerMultiProcessor;
-    ctx.nMaxThreadsPerBlock = prop.maxThreadsPerBlock;
-    ctx.nSharedMemPerBlock = prop.sharedMemPerBlock;
-    ctx.nCudaDevAttrComputeCapabilityMajor = prop.major;
-    ctx.nCudaDevAttrComputeCapabilityMinor = prop.minor;
-}
-
-
-
-unsigned char getViableThreshold(const cv::Mat& gray_frame) {
-    if (gray_frame.empty()) return 128; // Safety fallback
-    cv::Scalar mean_val = cv::mean(gray_frame);
-    return 0.9*static_cast<unsigned char>(mean_val.val[0]);
-}
-
+/**
+ * Helper class for facilitating frame-by-frame processing
+ * Includes image properties, processing settings, streams, and buffers
+ */
 #define NUM_STREAMS 5
 class FrameProcessor {
     private:
@@ -183,6 +176,11 @@ class FrameProcessor {
         dim3 blocks;
 
     public:
+        /**
+         * Constructor
+         * Sets image properties and processing settings
+         * Then allocates buffers needed for each stream on device and host
+         */
         FrameProcessor(int w, int h, unsigned char threshold_value, int bw_mode) {
             this->gray_threshold = threshold_value;
             this->bw_mode = bw_mode;
@@ -212,6 +210,10 @@ class FrameProcessor {
             }
         }
 
+        /**
+         * Destructor
+         * Frees allocated memory from constructor
+         */
         ~FrameProcessor() {
             for (int i=0; i<NUM_STREAMS; i++) {
                 cudaFree(d_gray[i]);
@@ -222,10 +224,11 @@ class FrameProcessor {
             }
         }
 
-        void processFrame(
-            int stream_idx
-        ) {
-            
+        /**
+         * Run 
+         */
+        void processFrame(int stream_idx) {
+
             // threshold pre-processing
             threshold_kernel<<<blocks,threads, 0, streams[stream_idx]>>>(d_gray[stream_idx], d_bw[stream_idx], width, height, gray_threshold, bw_mode);
             cudaStreamSynchronize(streams[stream_idx]);
@@ -258,6 +261,9 @@ class FrameProcessor {
             }
         }
 
+        /**
+         * Load buffers for stream_idx and call processFrame()
+         */
         void copyAndStartFrameProcess(
             cv::Mat h_color_frame,
             int stream_idx
@@ -275,6 +281,9 @@ class FrameProcessor {
             processFrame(stream_idx);
         }
 
+        /**
+         * Wait for stream_idx to finish, then write back processed results to provided VideoWriter
+         */
         void writeBackFrameProcessResult(
             const int& stream_idx,
             cv::VideoWriter& writer
@@ -290,7 +299,10 @@ class FrameProcessor {
         }
 };
 
-
+/**
+ * Prompt for command line arguments, then process video file frame-by-frame. 
+ * Writes to outputs directory
+ */
 int main(int argc , char** argv) {
     std::string image_path;
     unsigned char threshold_value = 128; // Default value
@@ -298,7 +310,11 @@ int main(int argc , char** argv) {
 
     // --- Command Line Argument Parsing ---
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " -i <image_file_path> -t <threshold_value (0-255)> -m <b/w mode(0 = target black on white)>" << std::endl;
+        std::cerr << "Usage: " << argv[0] 
+            << "\t-i <image_file_path (required)>\n"
+            << "\t\t\t-t <threshold_value (0-255)>\n" 
+            << "\t\t\t-m <b/w mode(0 = target black on white)>\n" 
+            << std::endl;
         std::cerr << "Example: " << argv[0] << " -i inputs/cat.png -t 220 -m 0" << std::endl;
         return 1;
     }
@@ -391,7 +407,6 @@ int main(int argc , char** argv) {
         fp.writeBackFrameProcessResult(stream_idx, writer);
         frames_processed++;
         std::cout << "finished " << frames_processed << "th frame" << std::endl;
-
     }
 
     // clean up
@@ -399,8 +414,6 @@ int main(int argc , char** argv) {
 
     writer.release();
     cap.release();
-
-
 
     return 0;
 }
