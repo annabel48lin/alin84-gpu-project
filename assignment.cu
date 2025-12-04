@@ -46,10 +46,45 @@ __global__ void threshold_kernel(
 }
 
 /**
- * Helper fucntion for determining whether a pixel is black.
- * Used in ZHangSuenMark
+ * Kernel for applying the filter_kernel with provided radius
  */
-__device__ inline int isPixelBlack(
+__global__ void gaussian_filter_kernel(
+    const unsigned char* input, 
+    unsigned char* result, 
+    double* filter_kernel,
+    int radius,
+    int w, 
+    int h
+) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    float computed = 0.0f;
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            
+            int y_idx = y + dy;
+            int x_idx = x + dx;
+            
+            if (y_idx >= 0 && y_idx < h && 
+                x_idx >= 0 && x_idx < w) 
+            {
+                int filter_idx = (dy + radius) * (2*radius+1) + (dx + radius);
+                double val = (double)input[y_idx * w + x_idx];
+
+                computed += filter_kernel[filter_idx] * val;
+            }
+        }
+    }
+    result[y*w+x] = computed;
+}
+
+/**
+ * Helper function for determining whether a pixel is foreground (black).
+ * Used in ZhangSuenMark
+ */
+__device__ inline int isForeground(
     const unsigned char* img , 
     int x, 
     int y, 
@@ -75,21 +110,21 @@ void ZhangSuenMark(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
 
-    int p1 = isPixelBlack(src, x, y, w, h);
-    // ! the pixel is black (cond0)
+    int p1 = isForeground(src, x, y, w, h);
+    // ! the pixel is black (cond0) , where black is foreground
     if (!p1) {
         mark[y*w + x] = 0; 
         return;
     }
 
-    int p2 = isPixelBlack(src, x-1, y-1, w, h); // top left
-    int p3 = isPixelBlack(src, x-1, y, w, h);   // left
-    int p4 = isPixelBlack(src, x-1, y+1, w, h); // bottom left
-    int p5 = isPixelBlack(src, x, y+1, w, h);   // bottom
-    int p6 = isPixelBlack(src, x+1, y+1, w, h); // bottom right
-    int p7 = isPixelBlack(src, x+1, y, w, h);   // right 
-    int p8 = isPixelBlack(src, x+1, y-1, w, h); // top right
-    int p9 = isPixelBlack(src, x, y-1, w, h);   // top
+    int p2 = isForeground(src, x-1, y-1, w, h); // top left
+    int p3 = isForeground(src, x-1, y, w, h);   // left
+    int p4 = isForeground(src, x-1, y+1, w, h); // bottom left
+    int p5 = isForeground(src, x, y+1, w, h);   // bottom
+    int p6 = isForeground(src, x+1, y+1, w, h); // bottom right
+    int p7 = isForeground(src, x+1, y, w, h);   // right 
+    int p8 = isForeground(src, x+1, y-1, w, h); // top right
+    int p9 = isForeground(src, x, y-1, w, h);   // top
 
 
     // A(i,j) = number of transitions from white to black 
@@ -143,6 +178,48 @@ __global__ void removeMarked(unsigned char* img, const unsigned char* mark, int 
 }
 
 /**
+ * Mark pixels that are endpoints (to remove)
+ * Note: Skeleton image is white, background is black
+ */
+__global__ void markEndpoints(unsigned char* skeleton, unsigned char* mark, int w, int h) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= w || y >= h) return;
+
+    // skip background pixels immediately
+    if (!isForeground(skeleton, x, y, w, h)) {
+        mark[y*w + x] = 0;
+        return;
+    }
+
+    int neighbors = 0;
+
+    // 8-neighbor offsets
+    int dx[] = {-1, 0, 1, 1, 1, 0, -1, -1};
+    int dy[] = {-1, -1, -1, 0, 1, 1, 1, 0};
+
+    for (int i = 0; i < 8; ++i) {
+        int nx = x + dx[i];
+        int ny = y + dy[i];
+
+        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+            // count *foreground* neighbors
+            if (isForeground(skeleton, nx, ny, w, h)) {
+                neighbors++;
+            }
+        }
+    }
+
+    // endpoint: exactly one foreground neighbor
+    if (neighbors == 1) {
+        mark[y*w + x] = 1;
+    } else {
+        mark[y*w + x] = 0;
+    }
+}
+
+/**
  * Helper class for facilitating frame-by-frame processing
  * Includes image properties, processing settings, streams, and buffers
  */
@@ -155,13 +232,17 @@ class FrameProcessor {
         int bufferSize_gray;
         int img_size;
         // processing settings
+        int gauss_radius = 2;
+        int gauss_sigma = 1;
         unsigned char gray_threshold;
         int bw_mode;
+        bool spur_removal;
 
         // per-stream variables/buffers
         cudaStream_t streams[NUM_STREAMS];
 
         // device pointers
+        double *d_gauss_filter;
         unsigned char* d_gray[NUM_STREAMS];
         unsigned char* d_bw[NUM_STREAMS];
         unsigned char *d_mark[NUM_STREAMS];
@@ -169,6 +250,8 @@ class FrameProcessor {
         // host 
         unsigned char *h_pinned_buffer[NUM_STREAMS];
         cv::Mat h_result_mats[NUM_STREAMS];
+        cv::Mat h_original_mats[NUM_STREAMS];
+
 
         // gpu blocks thread dim
         int BLOCK = 16;
@@ -181,9 +264,11 @@ class FrameProcessor {
          * Sets image properties and processing settings
          * Then allocates buffers needed for each stream on device and host
          */
-        FrameProcessor(int w, int h, unsigned char threshold_value, int bw_mode) {
+        FrameProcessor(int w, int h, int gauss_radius, unsigned char threshold_value, int bw_mode, bool spur_removal) {
+            this->gauss_radius = gauss_radius;
             this->gray_threshold = threshold_value;
             this->bw_mode = bw_mode;
+            this->spur_removal = spur_removal;
             
             this->width = w;
             this->height = h;
@@ -208,6 +293,17 @@ class FrameProcessor {
                 // Initialize output Mat to use the pinned memory buffer
                 h_result_mats[i] = cv::Mat(height, width, CV_8UC1, h_pinned_buffer[i]);
             }
+
+            // set up gaussian filter. Use opencv as helper, but wrote custom kernel
+            int kernelsize = 2*gauss_radius+1;
+            cv::Mat kernel_1D = cv::getGaussianKernel(kernelsize, gauss_sigma, CV_64F);
+            cv::Mat kernel_2D_double = kernel_1D * kernel_1D.t();
+            double* h_gauss_filter = (double*)kernel_2D_double.data;
+            cudaMalloc(&d_gauss_filter, kernelsize*kernelsize*sizeof(double));    
+            checkCudaError(cudaMemcpy(d_gauss_filter, h_gauss_filter, kernelsize*kernelsize*sizeof(double), 
+                                            cudaMemcpyHostToDevice), 
+                            "H2D copy failed while copy gauss");
+
         }
 
         /**
@@ -228,13 +324,16 @@ class FrameProcessor {
          * Run 
          */
         void processFrame(int stream_idx) {
+            // Gaussian blur preproceessing
+            // intermediate result alloc
+            unsigned char* d_blurred_intermed;
+            cudaMalloc(&d_blurred_intermed, width*height*sizeof(unsigned char));
+            gaussian_filter_kernel<<<blocks, threads, 0, streams[stream_idx]>>>(d_gray[stream_idx], d_blurred_intermed, d_gauss_filter, gauss_radius, width, height);
 
             // threshold pre-processing
-            threshold_kernel<<<blocks,threads, 0, streams[stream_idx]>>>(d_gray[stream_idx], d_bw[stream_idx], width, height, gray_threshold, bw_mode);
-            cudaStreamSynchronize(streams[stream_idx]);
+            threshold_kernel<<<blocks, threads, 0, streams[stream_idx]>>>(d_blurred_intermed, d_bw[stream_idx], width, height, gray_threshold, bw_mode);
 
             // skeletonization (Zhang Suen) 
-
             int max_itr = 1000; // in case no success
             bool changed;
             for (int itr=0; itr<max_itr; itr++) {
@@ -259,6 +358,29 @@ class FrameProcessor {
             if (changed) {
                 std::cout << "did not finish zhang suen" << std::endl;
             }
+
+            if (spur_removal) {
+                // remove spurs
+                const int PRUNE_ITERATIONS = 1000;
+                cudaMemsetAsync(d_mark[stream_idx], 0, img_size, streams[stream_idx]);
+                for (int i = 0; i < PRUNE_ITERATIONS; ++i) {
+                    cudaMemsetAsync(d_mark[stream_idx], 0, img_size, streams[stream_idx]);
+                    markEndpoints<<<blocks, threads, 0, streams[stream_idx]>>>(d_bw[stream_idx], d_mark[stream_idx], width, height);
+                    cudaStreamSynchronize(streams[stream_idx]);
+
+                    // sum marks
+                    thrust::device_ptr<unsigned char> dev_prune_mark(d_mark[stream_idx]);
+                    int numPruneMarked = thrust::reduce(thrust::device, dev_prune_mark, dev_prune_mark + width*height, 0);
+                    // std::cout << "prune iter " << i << " numPruneMarked = " << numPruneMarked << std::endl;
+
+                    if (numPruneMarked == 0) break;
+
+                    removeMarked<<<blocks,threads, 0, streams[stream_idx]>>>(d_bw[stream_idx], d_mark[stream_idx], width, height);
+                    cudaStreamSynchronize(streams[stream_idx]);
+                }
+            }
+            cudaFree(d_blurred_intermed);
+
         }
 
         /**
@@ -269,6 +391,7 @@ class FrameProcessor {
             int stream_idx
         ) {
             cv::Mat h_gray_frame;
+            h_color_frame.copyTo(h_original_mats[stream_idx]);
 
             // convert RGB --> Grayscale
             cv::cvtColor(h_color_frame, h_gray_frame, cv::COLOR_BGR2GRAY);
@@ -295,7 +418,11 @@ class FrameProcessor {
                             "D2H copy failed");
 
             checkCudaError(cudaStreamSynchronize(streams[stream_idx]), "D2H sync failed");
-            writer.write(h_result_mats[stream_idx]);
+            // overlay on top of original video for clearer comparison
+            cv::Mat overlay;
+            (h_original_mats[stream_idx]).copyTo(overlay);
+            overlay.setTo(cv::Scalar(0,0,255), h_result_mats[stream_idx] > 0);
+            writer.write(overlay);
         }
 };
 
@@ -305,8 +432,10 @@ class FrameProcessor {
  */
 int main(int argc , char** argv) {
     std::string image_path;
+    int gauss_radius = 5;
     unsigned char threshold_value = 128; // Default value
     int bw_mode = 1; // white on black
+    bool spur_removal = false;
 
     // --- Command Line Argument Parsing ---
     if (argc < 3) {
@@ -314,6 +443,7 @@ int main(int argc , char** argv) {
             << "\t-i <image_file_path (required)>\n"
             << "\t\t\t-t <threshold_value (0-255)>\n" 
             << "\t\t\t-m <b/w mode(0 = target black on white)>\n" 
+            << "\t\t\t-s spur removal\n" 
             << std::endl;
         std::cerr << "Example: " << argv[0] << " -i inputs/cat.png -t 220 -m 0" << std::endl;
         return 1;
@@ -335,6 +465,10 @@ int main(int argc , char** argv) {
         } else if (arg == "-m" && i + 1 < argc) {
             int m = std::atoi(argv[++i]);
             bw_mode = m > 0 ? 1 : 0;
+        } else if (arg == "-s") {
+            spur_removal = true;
+        } else if (arg == "-g" && i + 1 < argc) {
+            gauss_radius = std::atoi(argv[++i]);
         }
     }
     
@@ -353,24 +487,24 @@ int main(int argc , char** argv) {
     int total_frames = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
 
     std::cout << "Input Video: " << image_path << " (" << w << "x" << h << ", " << fps << " FPS, " << total_frames << " frames)" << std::endl;
-    std::cout << "Running skeletonization targeting " << (bw_mode ? "white object on black background" : "black object on white background") << " and bw threshold value " << std::to_string(threshold_value) << std::endl;
+    std::cout << "Running skeletonization targeting " << (bw_mode ? "white object on black background" : "black object on white background") << " and bw threshold value " << std::to_string(threshold_value) << (spur_removal ? " and spur removal" : "") << std::endl;
 
     // set up output dir + writer
     std::filesystem::path input_path(image_path);
     std::string base_name = input_path.stem().string();
     std::filesystem::path output_path = std::filesystem::path("outputs") / 
-                                            (base_name + "_skeleton_t" + std::to_string(threshold_value) + "_" + (bw_mode ? "w" : "b") + ".avi");
+                                            (base_name + "_skeleton" + ("_g" + std::to_string(gauss_radius)) + ("_t" + std::to_string(threshold_value)) + "_" + (bw_mode ? "WoB" : "BoW") + (spur_removal ? "_rmspurs" : "") + ".avi");
     std::filesystem::create_directories("outputs");
     std::string output_filename = output_path.string();
 
-    cv::VideoWriter writer(output_filename, fourcc, fps, cv::Size(w, h), false); // 'false' for single channel (grayscale) output
+    cv::VideoWriter writer(output_filename, fourcc, fps, cv::Size(w, h), true); // 'false' for single channel (grayscale) output
     if (!writer.isOpened()) {
         std::cerr << "Error: Could not open the output video writer." << std::endl;
         return -1;
     }
 
     // create FrameProcessor object
-    FrameProcessor fp(w, h, threshold_value, bw_mode);
+    FrameProcessor fp(w, h, gauss_radius, threshold_value, bw_mode, spur_removal);
 
     // kick off initial streams
     cv::Mat h_color_frame;
